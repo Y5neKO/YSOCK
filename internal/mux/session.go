@@ -84,12 +84,15 @@ func (s *Session) PopSynPend() *protocol.Packet {
 }
 
 // PushOutbound 接收来自 SOCKS5 客户端的数据（待发送到目标）
+// 必须拷贝数据，因为调用方（relay）会复用 buffer
 func (s *Session) PushOutbound(data []byte) {
 	if s.IsClosed() {
 		return
 	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
 	s.outMu.Lock()
-	s.outbound = append(s.outbound, data)
+	s.outbound = append(s.outbound, cp)
 	s.outMu.Unlock()
 	select {
 	case s.outNotify <- struct{}{}:
@@ -131,19 +134,14 @@ func (s *Session) OutboundReady() <-chan struct{} {
 }
 
 // PushInbound 接收来自隧道的数据（来自目标，待发送到 SOCKS5 客户端）
+// 阻塞式写入，不丢弃数据（TLS 连接丢任何字节都会导致后续全部损坏）
 func (s *Session) PushInbound(data []byte) {
 	if s.IsClosed() {
 		return
 	}
 	select {
 	case s.inbound <- data:
-	default:
-		// 缓冲满，丢弃最旧数据
-		select {
-		case <-s.inbound:
-		default:
-		}
-		s.inbound <- data
+	case <-s.closeCh:
 	}
 }
 

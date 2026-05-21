@@ -342,8 +342,7 @@ if (isFullDuplexReq) {
         getSessions().put((long)sid, sock);
 
         // 3. 发送 ACK 帧
-        synchronized (ros) { writeFrameOS(ros, 0x00, new byte[0]); }
-        ros.flush(); response.flushBuffer();
+        synchronized (ros) { writeFrameOS(ros, 0x00, new byte[0]); ros.flush(); }
 
         // 4. 启动后台线程：读目标 → 写 response
         final Socket fsock = sock;

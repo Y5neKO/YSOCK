@@ -137,10 +137,27 @@ func (fs *fullDuplexSession) readLoop() {
 		default:
 		}
 
+		// 设置读超时，防止死连接无限阻塞
+		fs.conn.SetReadDeadline(time.Now().Add(idleTimeout))
+
 		typ, data, err := readStreamFrame(fs.reader, fs.tunnel.cipher)
 		if err != nil {
+			// 超时且会话未关闭 → 可能是暂时空闲，继续等待
+			if isTimeout(err) {
+				select {
+				case <-fs.session.CloseCh():
+					return
+				case <-fs.tunnel.closeCh:
+					return
+				default:
+					continue
+				}
+			}
 			return
 		}
+
+		// 成功读取，清除 deadline
+		fs.conn.SetReadDeadline(time.Time{})
 
 		switch typ {
 		case 0x01: // DATA
@@ -238,8 +255,10 @@ func (cr *chunkedReader) Read(p []byte) (int, error) {
 	n, err := io.ReadFull(cr.reader, p[:toRead])
 	cr.n -= int64(n)
 	if cr.n == 0 {
-		// 读取 chunk trailing CRLF
-		cr.reader.ReadString('\n')
+		// 读取 chunk trailing CRLF，错误传播到下次调用
+		if _, trailErr := cr.reader.ReadString('\n'); trailErr != nil {
+			cr.err = trailErr
+		}
 	}
 	return n, err
 }
@@ -363,5 +382,12 @@ func DetectFullDuplex(urlStr string, cipher *ycrypto.Cipher) bool {
 		}
 	}
 
+	return false
+}
+
+func isTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
 	return false
 }

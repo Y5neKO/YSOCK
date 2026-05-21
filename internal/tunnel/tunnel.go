@@ -148,7 +148,19 @@ func (t *Tunnel) Stop() {
 
 func (t *Tunnel) DialFunc() func(network, target string) (io.ReadWriteCloser, error) {
 	return func(network, target string) (io.ReadWriteCloser, error) {
-		return t.factory.OpenSession(target)
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				logf("retry dial %s (attempt %d)", target, attempt+1)
+				time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+			}
+			conn, err := t.factory.OpenSession(target)
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
 	}
 }
 

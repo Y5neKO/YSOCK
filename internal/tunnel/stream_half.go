@@ -114,6 +114,7 @@ func (ss *halfDuplexSession) readLoop() {
 
 		typ, data, err := readStreamFrame(ss.resp.Body, ss.tunnel.cipher)
 		if err != nil {
+			// Half duplex 流式响应断开 → 会话不可恢复，直接退出
 			return
 		}
 

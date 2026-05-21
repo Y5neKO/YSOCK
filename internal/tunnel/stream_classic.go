@@ -118,6 +118,9 @@ func (cs *classicSession) pollLoop() {
 	ticker := time.NewTicker(classicPollInterval)
 	defer ticker.Stop()
 
+	const maxConsecutiveErrors = 5
+	consecutiveErrors := 0
+
 	for {
 		select {
 		case <-cs.session.OutboundReady():
@@ -146,8 +149,13 @@ func (cs *classicSession) pollLoop() {
 
 		resp, err := cs.tunnel.client.Post(cs.tunnel.url, "application/json", bytes.NewReader(body))
 		if err != nil {
-			logf("classic poll error sid=%d: %v", cs.sid, err)
-			return
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutiveErrors {
+				logf("classic poll max errors sid=%d, giving up", cs.sid)
+				return
+			}
+			logf("classic poll error sid=%d (%d/%d): %v", cs.sid, consecutiveErrors, maxConsecutiveErrors, err)
+			continue
 		}
 
 		var pollResp struct {
@@ -158,11 +166,18 @@ func (cs *classicSession) pollLoop() {
 		resp.Body.Close()
 
 		if jsonErr != nil {
-			if jsonErr == io.EOF {
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutiveErrors {
 				return
+			}
+			if jsonErr != io.EOF {
+				logf("classic poll decode error sid=%d (%d/%d): %v", cs.sid, consecutiveErrors, maxConsecutiveErrors, jsonErr)
 			}
 			continue
 		}
+
+		// 成功，重置错误计数
+		consecutiveErrors = 0
 
 		// 处理响应中的数据
 		if pollResp.D != "" {
