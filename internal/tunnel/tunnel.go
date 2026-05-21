@@ -112,6 +112,13 @@ func (t *Tunnel) nextSeq() uint32 {
 }
 
 func (t *Tunnel) Run() error {
+	// 所有模式都先验证连通性和 key 正确性
+	logf("probing %s ...", t.url)
+	if err := Probe(t.url, t.cipher, t.client); err != nil {
+		return fmt.Errorf("probe %s: %w", t.url, err)
+	}
+	logf("probe ok, payload reachable and key verified")
+
 	if t.mode == ModeAuto {
 		detected := DetectMode(t.url, t.cipher, t.client)
 		t.mode = detected

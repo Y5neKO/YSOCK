@@ -461,6 +461,14 @@ function performClassicPoll($j, $KEY) {
 
 // ---- 主入口：路由分发 ----
 
+// full duplex detection: PHP does not support continuous input stream, reject with empty response
+$ct = isset($_SERVER['CONTENT_TYPE']) ? $_SERVER['CONTENT_TYPE'] : '';
+if (strpos($ct, 'application/octet-stream') === 0 && strpos($ct, 'application/json') === false) {
+    // PHP cannot do full duplex - return nothing so client degrades to half
+    echo '';
+    exit;
+}
+
 $input = file_get_contents('php://input');
 if (empty($input)) {
     echo '{"d":""}';
