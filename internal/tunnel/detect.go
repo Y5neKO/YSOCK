@@ -10,10 +10,9 @@ import (
 	"time"
 
 	ycrypto "github.com/y5neko/ysock/internal/crypto"
+	"github.com/y5neko/ysock/internal/logger"
 )
 
-// Probe 验证 payload URL 是否可达且 key 正确。
-// 发送握手请求，验证服务端能正确加密回显测试数据。
 func Probe(url string, cipher *ycrypto.Cipher, client *http.Client) error {
 	testData := cipher.Encrypt([]byte("YSOCK_PING"))
 	encoded := base64.StdEncoding.EncodeToString(testData)
@@ -42,7 +41,6 @@ func Probe(url string, cipher *ycrypto.Cipher, client *http.Client) error {
 		return fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
-	// 读取响应
 	var ackResp struct {
 		D string `json:"d"`
 		M int    `json:"m"`
@@ -55,7 +53,6 @@ func Probe(url string, cipher *ycrypto.Cipher, client *http.Client) error {
 		return fmt.Errorf("empty response — key mismatch or payload error")
 	}
 
-	// 验证解密
 	enc, _ := base64.StdEncoding.DecodeString(ackResp.D)
 	plain, err := cipher.Decrypt(enc)
 	if err != nil {
@@ -66,18 +63,19 @@ func Probe(url string, cipher *ycrypto.Cipher, client *http.Client) error {
 		return fmt.Errorf("echo mismatch — payload returned unexpected data")
 	}
 
+	logger.Debugf(tag, "probe handshake resp m=%d", ackResp.M)
 	return nil
 }
 
-// DetectMode 自动检测服务端支持的最优模式。
-// 调用方应确保 Probe 已通过。
 func DetectMode(url string, cipher *ycrypto.Cipher, client *http.Client) Mode {
-	// 1. 尝试 Full Duplex（原始 TCP + application/octet-stream）
+	logger.Debugf(tag, "detecting optimal mode...")
+
 	if DetectFullDuplex(url, cipher) {
+		logger.Debugf(tag, "detect: full duplex supported")
 		return ModeFullDuplex
 	}
+	logger.Debugf(tag, "detect: full duplex not available, testing half duplex...")
 
-	// 2. 检测 Half Duplex（标准 HTTP 流式响应）
 	return detectHalfDuplex(url, cipher, client)
 }
 
@@ -95,6 +93,7 @@ func detectHalfDuplex(url string, cipher *ycrypto.Cipher, client *http.Client) M
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
+		logger.Debugf(tag, "detect half duplex: create request failed: %v", err)
 		return ModeClassic
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -102,15 +101,19 @@ func detectHalfDuplex(url string, cipher *ycrypto.Cipher, client *http.Client) M
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
+		logger.Debugf(tag, "detect half duplex: request failed: %v", err)
 		return ModeClassic
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		logger.Debugf(tag, "detect half duplex: status %d", resp.StatusCode)
 		return ModeClassic
 	}
 
 	ct := resp.Header.Get("Content-Type")
+	logger.Debugf(tag, "detect half duplex: content-type=%s", ct)
+
 	if ct == "application/octet-stream" {
 		lenBuf := make([]byte, 4)
 		readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -124,15 +127,20 @@ func detectHalfDuplex(url string, cipher *ycrypto.Cipher, client *http.Client) M
 
 		select {
 		case <-done:
+			logger.Debugf(tag, "detect: half duplex confirmed (octet-stream + data)")
 			return ModeHalfDuplex
 		case <-readCtx.Done():
+			logger.Debugf(tag, "detect: octet-stream but no data → classic")
 			return ModeClassic
 		}
 	}
 
 	elapsed := time.Since(start)
+	logger.Debugf(tag, "detect half duplex: elapsed=%v ct=%s", elapsed, ct)
 	if elapsed < 3*time.Second {
+		logger.Debugf(tag, "detect: half duplex (fast response)")
 		return ModeHalfDuplex
 	}
+	logger.Debugf(tag, "detect: classic (slow response %v)", elapsed)
 	return ModeClassic
 }

@@ -4,9 +4,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
+
+	"github.com/y5neko/ysock/internal/logger"
 )
+
+const tag = "socks5"
 
 const (
 	socksVersion = 0x05
@@ -38,12 +41,12 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("listen %s: %w", s.Addr, err)
 	}
 	defer ln.Close()
-	log.Printf("[socks5] listening on %s", s.Addr)
+	logger.Infof(tag, "listening on %s", s.Addr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("[socks5] accept: %v", err)
+			logger.Errorf(tag, "accept: %v", err)
 			continue
 		}
 		go s.handleConn(conn)
@@ -55,14 +58,16 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	target, err := s.handshake(conn)
 	if err != nil {
-		log.Printf("[socks5] handshake: %v", err)
+		logger.Debugf(tag, "handshake %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
+	logger.Debugf(tag, "connect %s → %s", conn.RemoteAddr(), target)
+
 	remote, err := s.Dialer("tcp", target)
 	if err != nil {
-		log.Printf("[socks5] dial %s: %v", target, err)
-		sendReply(conn, 0x05, nil) // connection refused
+		logger.Errorf(tag, "dial %s: %v", target, err)
+		sendReply(conn, 0x05, nil)
 		return
 	}
 	defer remote.Close()
@@ -87,12 +92,10 @@ func (s *Server) handshake(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("read methods: %w", err)
 	}
 
-	// reply: no auth
 	if _, err := conn.Write([]byte{socksVersion, authNone}); err != nil {
 		return "", fmt.Errorf("write method: %w", err)
 	}
 
-	// read request
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return "", fmt.Errorf("read request header: %w", err)

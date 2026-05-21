@@ -14,11 +14,11 @@ import (
 	"time"
 
 	ycrypto "github.com/y5neko/ysock/internal/crypto"
+	"github.com/y5neko/ysock/internal/logger"
 	"github.com/y5neko/ysock/internal/mux"
 	"github.com/y5neko/ysock/internal/protocol"
 )
 
-// 用超大 Content-Length 使 Tomcat 的 request.getInputStream() 持续可用
 const fullDuplexContentLength = 1073741824 // 1GB
 
 type FullDuplexFactory struct {
@@ -41,20 +41,20 @@ func (f *FullDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 	session := t.manager.Create(target)
 	sid := session.SID()
 
+	logger.Debugf(tag, "full open sid=%d target=%s:%d", sid, host, port)
+
 	u, err := url.Parse(t.url)
 	if err != nil {
 		t.manager.Remove(sid)
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 
-	// 建立原始 TCP 连接
 	conn, err := dialRaw(u)
 	if err != nil {
 		t.manager.Remove(sid)
 		return nil, fmt.Errorf("dial raw: %w", err)
 	}
 
-	// 构造 SYN body（action='f'）
 	synData := mux.EncodeTarget(host, port)
 	synFrame := &protocol.Frame{Packets: []*protocol.Packet{
 		{Flag: protocol.FlagSYN, SID: sid, SEQ: t.nextSeq(), Data: synData},
@@ -68,7 +68,6 @@ func (f *FullDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 		"d": encoded,
 	})
 
-	// 发送 HTTP POST 请求（超大 Content-Length，初始 body 是 JSON）
 	httpReq := buildLargeContentLengthPost(u, "application/octet-stream", jsonBody)
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := conn.Write(httpReq); err != nil {
@@ -77,7 +76,6 @@ func (f *FullDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 		return nil, fmt.Errorf("write http request: %w", err)
 	}
 
-	// 读取 HTTP 响应头
 	reader := bufio.NewReader(conn)
 	if err := skipHTTPResponse(reader); err != nil {
 		conn.Close()
@@ -85,7 +83,6 @@ func (f *FullDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 		return nil, fmt.Errorf("read http response: %w", err)
 	}
 
-	// 读取 ACK 帧（响应使用 chunked 编码，需要解码）
 	cr := newChunkedReader(reader)
 	ackType, _, err := readStreamFrame(cr, t.cipher)
 	if err != nil {
@@ -99,8 +96,8 @@ func (f *FullDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 		return nil, fmt.Errorf("unexpected ack type: 0x%02x", ackType)
 	}
 
-	// 连接成功，清除 deadline
 	conn.SetDeadline(time.Time{})
+	logger.Debugf(tag, "full session established sid=%d", sid)
 
 	fs := &fullDuplexSession{
 		sid:     sid,
@@ -133,16 +130,15 @@ func (fs *fullDuplexSession) readLoop() {
 	for {
 		select {
 		case <-fs.tunnel.closeCh:
+			logger.Debugf(tag, "full read sid=%d: tunnel closing", fs.sid)
 			return
 		default:
 		}
 
-		// 设置读超时，防止死连接无限阻塞
 		fs.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 
 		typ, data, err := readStreamFrame(fs.reader, fs.tunnel.cipher)
 		if err != nil {
-			// 超时且会话未关闭 → 可能是暂时空闲，继续等待
 			if isTimeout(err) {
 				select {
 				case <-fs.session.CloseCh():
@@ -153,16 +149,18 @@ func (fs *fullDuplexSession) readLoop() {
 					continue
 				}
 			}
+			logger.Debugf(tag, "full read sid=%d: %v", fs.sid, err)
 			return
 		}
 
-		// 成功读取，清除 deadline
 		fs.conn.SetReadDeadline(time.Time{})
 
 		switch typ {
 		case 0x01: // DATA
 			fs.session.PushInbound(data)
+			logger.Debugf(tag, "full recv sid=%d len=%d", fs.sid, len(data))
 		case 0x02: // FIN
+			logger.Debugf(tag, "full recv FIN sid=%d", fs.sid)
 			return
 		}
 	}
@@ -186,14 +184,16 @@ func (fs *fullDuplexSession) writeLoop() {
 		}
 
 		if err := writeStreamFrame(fs.conn, 0x01, data, fs.tunnel.cipher); err != nil {
-			logf("full write error sid=%d: %v", fs.sid, err)
+			logger.Errorf(tag, "full write sid=%d: %v", fs.sid, err)
 			return
 		}
+		logger.Debugf(tag, "full send sid=%d len=%d", fs.sid, len(data))
 	}
 }
 
 func (fs *fullDuplexSession) cleanup() {
 	fs.once.Do(func() {
+		logger.Debugf(tag, "full cleanup sid=%d", fs.sid)
 		_ = writeStreamFrame(fs.conn, 0x02, nil, fs.tunnel.cipher)
 		fs.conn.Close()
 		fs.session.Close()
@@ -203,10 +203,9 @@ func (fs *fullDuplexSession) cleanup() {
 
 // ---- Chunked Transfer Encoding Reader ----
 
-// chunkedReader 解码 HTTP chunked transfer encoding
 type chunkedReader struct {
 	reader *bufio.Reader
-	n      int64 // remaining bytes in current chunk
+	n      int64
 	err    error
 }
 
@@ -219,7 +218,6 @@ func (cr *chunkedReader) Read(p []byte) (int, error) {
 		return 0, cr.err
 	}
 	if cr.n == 0 {
-		// 读取下一个 chunk size
 		line, err := cr.reader.ReadString('\n')
 		if err != nil {
 			cr.err = err
@@ -239,9 +237,7 @@ func (cr *chunkedReader) Read(p []byte) (int, error) {
 			}
 		}
 		if size == 0 {
-			// terminal chunk
 			cr.err = io.EOF
-			// 读取 trailing CRLF
 			cr.reader.ReadString('\n')
 			return 0, io.EOF
 		}
@@ -255,7 +251,6 @@ func (cr *chunkedReader) Read(p []byte) (int, error) {
 	n, err := io.ReadFull(cr.reader, p[:toRead])
 	cr.n -= int64(n)
 	if cr.n == 0 {
-		// 读取 chunk trailing CRLF，错误传播到下次调用
 		if _, trailErr := cr.reader.ReadString('\n'); trailErr != nil {
 			cr.err = trailErr
 		}
@@ -299,8 +294,6 @@ func dialRaw(u *url.URL) (net.Conn, error) {
 	return conn, nil
 }
 
-// buildLargeContentLengthPost 构造超大 Content-Length 的 HTTP POST
-// body 是初始数据，后续数据通过同一连接持续发送
 func buildLargeContentLengthPost(u *url.URL, contentType string, body []byte) []byte {
 	reqPath := u.Path
 	if u.RawQuery != "" {
@@ -336,7 +329,6 @@ func skipHTTPResponse(reader *bufio.Reader) error {
 	return nil
 }
 
-// DetectFullDuplex 检测服务端是否支持全双工
 func DetectFullDuplex(urlStr string, cipher *ycrypto.Cipher) bool {
 	u, err := url.Parse(urlStr)
 	if err != nil {
@@ -345,11 +337,11 @@ func DetectFullDuplex(urlStr string, cipher *ycrypto.Cipher) bool {
 
 	conn, err := dialRaw(u)
 	if err != nil {
+		logger.Debugf(tag, "detect full duplex: dial raw failed: %v", err)
 		return false
 	}
 	defer conn.Close()
 
-	// 发送握手请求（Content-Type: application/octet-stream + 超大 Content-Length）
 	testData := cipher.Encrypt([]byte("YSOCK_PING"))
 	encoded := base64.StdEncoding.EncodeToString(testData)
 	jsonBody, _ := json.Marshal(map[string]string{
@@ -360,23 +352,25 @@ func DetectFullDuplex(urlStr string, cipher *ycrypto.Cipher) bool {
 	httpReq := buildLargeContentLengthPost(u, "application/octet-stream", jsonBody)
 	conn.SetDeadline(time.Now().Add(8 * time.Second))
 	if _, err := conn.Write(httpReq); err != nil {
+		logger.Debugf(tag, "detect full duplex: write failed: %v", err)
 		return false
 	}
 
 	reader := bufio.NewReader(conn)
 	if err := skipHTTPResponse(reader); err != nil {
+		logger.Debugf(tag, "detect full duplex: skip response failed: %v", err)
 		return false
 	}
 
-	// 尝试读取响应数据
 	var buf [4096]byte
 	n, err := reader.Read(buf[:])
 	if err != nil && err != io.EOF {
+		logger.Debugf(tag, "detect full duplex: read response failed: %v", err)
 		return false
 	}
 	if n > 0 {
 		data := string(buf[:n])
-		// JSON 响应包含 "d" 字段说明 JSP 正常处理了 octet-stream 请求
+		logger.Debugf(tag, "detect full duplex: response=%q", data)
 		if strings.Contains(data, `"d"`) {
 			return true
 		}

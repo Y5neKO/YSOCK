@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -15,9 +14,12 @@ import (
 	"time"
 
 	ycrypto "github.com/y5neko/ysock/internal/crypto"
+	"github.com/y5neko/ysock/internal/logger"
 	"github.com/y5neko/ysock/internal/mux"
 	"github.com/y5neko/ysock/internal/protocol"
 )
+
+const tag = "tunnel"
 
 const (
 	maxPayloadSize = 32 * 1024
@@ -112,12 +114,11 @@ func (t *Tunnel) nextSeq() uint32 {
 }
 
 func (t *Tunnel) Run() error {
-	// 所有模式都先验证连通性和 key 正确性
-	logf("probing %s ...", t.url)
+	logger.Infof(tag, "probing %s ...", t.url)
 	if err := Probe(t.url, t.cipher, t.client); err != nil {
 		return fmt.Errorf("probe %s: %w", t.url, err)
 	}
-	logf("probe ok, payload reachable and key verified")
+	logger.Infof(tag, "probe ok, payload reachable and key verified")
 
 	if t.mode == ModeAuto {
 		detected := DetectMode(t.url, t.cipher, t.client)
@@ -151,15 +152,19 @@ func (t *Tunnel) DialFunc() func(network, target string) (io.ReadWriteCloser, er
 		var lastErr error
 		for attempt := 0; attempt < 2; attempt++ {
 			if attempt > 0 {
-				logf("retry dial %s (attempt %d)", target, attempt+1)
+				logger.Infof(tag, "retry dial %s (attempt %d)", target, attempt+1)
 				time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
 			}
+			logger.Debugf(tag, "dial %s attempt=%d", target, attempt+1)
 			conn, err := t.factory.OpenSession(target)
 			if err == nil {
+				logger.Debugf(tag, "dial %s ok sid active=%d", target, t.manager.ActiveCount())
 				return conn, nil
 			}
 			lastErr = err
+			logger.Debugf(tag, "dial %s failed attempt=%d: %v", target, attempt+1, err)
 		}
+		logger.Errorf(tag, "dial %s failed after retries: %v", target, lastErr)
 		return nil, lastErr
 	}
 }
@@ -248,8 +253,4 @@ func sendClose(url string, sid uint32, client *http.Client) {
 	if err == nil {
 		resp.Body.Close()
 	}
-}
-
-func logf(format string, args ...interface{}) {
-	log.Printf("[tunnel] "+format, args...)
 }

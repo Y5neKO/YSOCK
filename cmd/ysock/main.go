@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/y5neko/ysock/internal/logger"
 	"github.com/y5neko/ysock/internal/payload"
 	"github.com/y5neko/ysock/internal/socks"
 	"github.com/y5neko/ysock/internal/tunnel"
@@ -38,16 +39,42 @@ func runClient(args []string) {
 	key := fs.String("k", "", "Encryption key")
 	listen := fs.String("l", "127.0.0.1:1080", "SOCKS5 listen address")
 	modeStr := fs.String("mode", "auto", "Tunnel mode: auto, full, half, classic")
+	verbose := fs.Bool("v", false, "Verbose output (debug level)")
+	logLevel := fs.String("log-level", "", "Log level: debug, info, error (overrides -v)")
 	fs.Parse(args)
 	if *url == "" || *key == "" {
-		fmt.Println("Usage: ysock client -u <url> -k <key> [-l <addr>] [-mode <mode>]")
+		fmt.Println("Usage: ysock client -u <url> -k <key> [-l <addr>] [-mode <mode>] [-v]")
 		os.Exit(1)
 	}
+
+	// 设置日志级别: --log-level 优先于 -v
+	if *logLevel != "" {
+		switch strings.ToLower(*logLevel) {
+		case "debug":
+			logger.SetLevel(logger.LevelDebug)
+		case "info":
+			logger.SetLevel(logger.LevelInfo)
+		case "error":
+			logger.SetLevel(logger.LevelError)
+		default:
+			fmt.Printf("Unknown log level: %s (use: debug, info, error)\n", *logLevel)
+			os.Exit(1)
+		}
+	} else if *verbose {
+		logger.SetLevel(logger.LevelDebug)
+	} else {
+		logger.SetLevel(logger.LevelInfo)
+	}
+
 	mode := tunnel.ParseMode(*modeStr)
 	log.Printf("[ysock] starting client v%s", version)
 	log.Printf("[ysock] payload: %s", *url)
 	log.Printf("[ysock] mode:    %s", mode)
 	log.Printf("[ysock] socks5:  %s", *listen)
+	if logger.GetLevel() >= logger.LevelDebug {
+		log.Printf("[ysock] log:     debug")
+	}
+
 	t := tunnel.NewTunnel(*url, *key, mode)
 	if err := t.Run(); err != nil {
 		log.Fatalf("[ysock] init error: %v", err)
@@ -100,22 +127,28 @@ func printUsage() {
 	fmt.Println("  payload  Generate web payload script")
 	fmt.Println("  version  Show version")
 	fmt.Println()
+	fmt.Println("Client flags:")
+	fmt.Println("  -u <url>       Payload URL (required)")
+	fmt.Println("  -k <key>       Encryption key (required)")
+	fmt.Println("  -l <addr>      SOCKS5 listen address (default: 127.0.0.1:1080)")
+	fmt.Println("  -mode <mode>   Tunnel mode: auto, full, half, classic (default: auto)")
+	fmt.Println("  -v             Verbose output (debug level)")
+	fmt.Println("  -log-level <l> Log level: debug, info, error (overrides -v)")
+	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  ysock client -u http://target/tunnel.php -k mysecret -l 127.0.0.1:1080")
+	fmt.Println("  ysock client -u http://target/tunnel.jsp -k mysecret -v")
 	fmt.Println("  ysock payload -t php -k mysecret -o tunnel.php")
 }
 
-// generatePHP 生成三模式 PHP payload (Half Duplex + Classic)
 func generatePHP(key string) string {
 	return strings.Replace(payload.PHPTemplate, "$KEY = 'CHANGE_ME'", "$KEY = '"+key+"'", 1)
 }
 
-// generateJSP 生成三模式 JSP payload (Half Duplex + Classic)
 func generateJSP(key string) string {
 	return strings.Replace(payload.JSPTemplate, `String KEY = "CHANGE_ME"`, `String KEY = "`+key+`"`, 1)
 }
 
-// generateASPX 生成使用 SHA256-CTR+HMAC 加密的 ASPX payload
 func generateASPX(key string) string {
 	return fmt.Sprintf(`<%%@ Page Language="C#" %%>
 <%%@ Import Namespace="System" %%>

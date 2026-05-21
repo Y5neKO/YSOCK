@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/y5neko/ysock/internal/logger"
 	"github.com/y5neko/ysock/internal/mux"
 )
 
@@ -33,6 +34,8 @@ func (f *HalfDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 
 	session := t.manager.Create(target)
 	sid := session.SID()
+
+	logger.Debugf(tag, "half open sid=%d target=%s:%d", sid, host, port)
 
 	body, err := buildSynBody(sid, t.nextSeq(), host, port, t.cipher)
 	if err != nil {
@@ -77,6 +80,8 @@ func (f *HalfDuplexFactory) OpenSession(target string) (io.ReadWriteCloser, erro
 		return nil, fmt.Errorf("unexpected ack type: 0x%02x", ackType)
 	}
 
+	logger.Debugf(tag, "half session established sid=%d", sid)
+
 	ss := &halfDuplexSession{
 		sid:     sid,
 		tunnel:  t,
@@ -114,14 +119,16 @@ func (ss *halfDuplexSession) readLoop() {
 
 		typ, data, err := readStreamFrame(ss.resp.Body, ss.tunnel.cipher)
 		if err != nil {
-			// Half duplex 流式响应断开 → 会话不可恢复，直接退出
+			logger.Debugf(tag, "half read sid=%d: %v", ss.sid, err)
 			return
 		}
 
 		switch typ {
 		case 0x01:
 			ss.session.PushInbound(data)
+			logger.Debugf(tag, "half recv sid=%d len=%d", ss.sid, len(data))
 		case 0x02:
+			logger.Debugf(tag, "half recv FIN sid=%d", ss.sid)
 			return
 		}
 	}
@@ -145,9 +152,10 @@ func (ss *halfDuplexSession) writeLoop() {
 		}
 
 		if err := ss.sendData(data); err != nil {
-			logf("write error sid=%d: %v", ss.sid, err)
+			logger.Errorf(tag, "half write sid=%d: %v", ss.sid, err)
 			return
 		}
+		logger.Debugf(tag, "half send sid=%d len=%d", ss.sid, len(data))
 	}
 }
 
@@ -166,6 +174,7 @@ func (ss *halfDuplexSession) sendData(data []byte) error {
 		resp, err := ss.tunnel.client.Post(ss.tunnel.url, "application/json", bytes.NewReader(body))
 		if err != nil {
 			lastErr = err
+			logger.Debugf(tag, "half sendData retry sid=%d attempt=%d: %v", ss.sid, i+1, err)
 			delay := writeBaseDelay * time.Duration(1<<uint(i))
 			if delay > 10*time.Second {
 				delay = 10 * time.Second
@@ -181,6 +190,7 @@ func (ss *halfDuplexSession) sendData(data []byte) error {
 
 func (ss *halfDuplexSession) cleanup() {
 	ss.once.Do(func() {
+		logger.Debugf(tag, "half cleanup sid=%d", ss.sid)
 		ss.cancel()
 		ss.resp.Body.Close()
 		ss.session.Close()
