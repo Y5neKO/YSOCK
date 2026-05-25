@@ -16,3 +16,9 @@ var ASPXTemplate string
 
 //go:embed tunnel.asp
 var ASPTemplate string
+
+//go:embed handler.java
+var JavaTemplate string
+
+//go:embed handler.cs
+var CSTemplate string

@@ -89,7 +89,7 @@ func runClient(args []string) {
 
 func runPayload(args []string) {
 	fs := flag.NewFlagSet("payload", flag.ExitOnError)
-	t := fs.String("t", "", "Payload type: jsp, jspx, php, aspx, asp")
+	t := fs.String("t", "", "Payload type: jsp, jspx, php, aspx, asp, java, cs")
 	k := fs.String("k", "", "Encryption key")
 	o := fs.String("o", "", "Output file")
 	fs.Parse(args)
@@ -109,6 +109,10 @@ func runPayload(args []string) {
 		data = generateASPX(*k)
 	case "asp":
 		data = generateASP(*k)
+	case "java":
+		data = generateJava(*k)
+	case "cs":
+		data = generateCS(*k)
 	default:
 		fmt.Printf("Unsupported payload type: %s\n", *t)
 		os.Exit(1)
@@ -163,4 +167,12 @@ func generateASPX(key string) string {
 
 func generateASP(key string) string {
 	return strings.Replace(payload.ASPTemplate, `var KEY = "CHANGE_ME"`, `var KEY = "`+key+`"`, 1)
+}
+
+func generateJava(key string) string {
+	return strings.Replace(payload.JavaTemplate, `private static String KEY = "CHANGE_ME"`, `private static String KEY = "`+key+`"`, 1)
+}
+
+func generateCS(key string) string {
+	return strings.Replace(payload.CSTemplate, `static string KEY = "CHANGE_ME"`, `static string KEY = "`+key+`"`, 1)
 }

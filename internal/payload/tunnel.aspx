@@ -366,7 +366,7 @@ bool isFullDuplexReq = reqCT != null && reqCT.StartsWith("application/octet-stre
 
 if (isFullDuplexReq)
 {
-    // === Full Duplex ===
+
     try
     {
         Stream reqIS = Request.InputStream;
@@ -433,7 +433,7 @@ if (isFullDuplexReq)
     return;
 }
 
-// === Non-Full-Duplex: JSON processing ===
+
 string bodyStr = "";
 using (var sr = new StreamReader(Request.InputStream)) bodyStr = sr.ReadToEnd();
 if (string.IsNullOrEmpty(bodyStr)) { Response.ContentType = "application/json"; Response.Write("{\"d\":\"\"}"); return; }

